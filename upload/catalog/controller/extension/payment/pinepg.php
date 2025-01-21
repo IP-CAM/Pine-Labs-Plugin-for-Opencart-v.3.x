@@ -1,5 +1,6 @@
 <?php
 class Controllerextensionpaymentpinepg extends Controller {
+	
   
   public function index() {
     $this->load->language('extension/payment/pinepg');
@@ -62,6 +63,8 @@ class Controllerextensionpaymentpinepg extends Controller {
 
 	$this->logger->write('Inside Initiate Payment method');
 
+	$callback_url = $this->getCallbackUrl();
+
         $PinePgMode=$this->config->get('payment_pinepg_mode');
 		if($PinePgMode == "live")
 		{
@@ -75,18 +78,25 @@ class Controllerextensionpaymentpinepg extends Controller {
 		return ['response_code' => 500, 'message' => 'Access token retrieval failed'];
 	}
 
+	$orderamount= $order_info['total'] * 100;
+
+	if (is_numeric($orderamount) && floor($orderamount) != $orderamount) {
+		$orderamount = ceil($orderamount);
+	}
+
 	$body = json_encode([
 		'merchant_order_reference' => $order_info['order_id'] . '_' . date('ymdHis'),
 		'order_amount' => [
-			'value' => $order_info['total'] * 100,
+			'value' => $orderamount,
 			'currency' => 'INR',
 		],
+		'callback_url' => $callback_url,
 		'purchase_details' => [
 			'customer' => [
 				'email_id' => $order_info['email'],
 				'first_name' => $order_info['firstname'],
 				'last_name' => $order_info['lastname'],
-				'customer_id' => $order_info['customer_id'],
+				//'customer_id' => $order_info['customer_id'],
 				'mobile_number' => $order_info['telephone'],
 			],
 		],
@@ -105,13 +115,28 @@ class Controllerextensionpaymentpinepg extends Controller {
 }
 
 
+public function getCallbackUrl() {
+    // Check if running locally
+    if (strpos($_SERVER['HTTP_HOST'], 'localhost') !== false) {
+        // Local environment
+        return 'http://localhost/opencart/index.php?route=extension/payment/pinepg/callback';
+    }
+
+    // Production or staging environment
+    $protocol = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https://' : 'http://';
+    $domain = $protocol . $_SERVER['HTTP_HOST'];
+    
+    return $domain . '/index.php?route=extension/payment/pinepg/callback';
+}
+
+
 
 private function getAccessToken() {
 
 	$PinePgMode=$this->config->get('payment_pinepg_mode');
 	if($PinePgMode == "live")
 	{
-		$url ='https://api.pluralpay.in/auth/token';
+		$url ='https://api.pluralpay.in/api/auth/v1/token';
 	}else{
 		$url ='https://pluraluat.v2.pinepg.in/api/auth/v1/token';
 	}
@@ -167,10 +192,104 @@ public function sendPostRequest($url, $body, $headers) {
 
     // Check for HTTP errors
     if ($httpCode >= 400) {
-        throw new Exception("HTTP error $httpCode: " . $response);
+        //throw new Exception("HTTP error $httpCode: " . $response);
     }
 
     return $response;
+}
+
+
+public function onOrderHistoryAdd($route, $args, $output) {
+
+    $order_id=$args[0];
+    $this->load->model('checkout/order');
+	$this->load->model('catalog/product');
+    
+	$order_info = $this->model_checkout_order->getOrder($order_id);
+
+	$this->logger = new Log('pinepg_'. date("Y-m-d").'.log');
+    
+
+    
+    $this->logger->write('Order Data'. serialize($order_info));
+	if($order_info['order_status']=='Refunded'){
+      $payment_response = $this->process_refund($order_info);
+	}
+	
+	
+}
+
+
+
+public function process_refund($order_info) {
+	
+
+	// Retrieve the Edge order ID from custom field or metadata
+	$this->load->model('extension/payment/pinepg');
+	$refund_order_id = $this->model_extension_payment_pinepg->getCheckoutOrderId($order_info['order_id']);
+
+	// Prepare API request URL
+	$PinePgMode=$this->config->get('payment_pinepg_mode');
+	if($PinePgMode == "live")
+	{
+		$url ='https://api.pluralpay.in/api/pay/v1/refunds/' . $refund_order_id;
+	}else{
+		$url ='https://pluraluat.v2.pinepg.in/api/pay/v1/refunds/' . $refund_order_id;
+	}
+
+
+
+	$orderamount= $order_info['total'] * 100;
+
+	if (is_numeric($orderamount) && floor($orderamount) != $orderamount) {
+		$orderamount = ceil($orderamount);
+	}
+
+	// Prepare the request payload
+	$body = json_encode([
+		'merchant_order_reference' => uniqid(),
+		'refund_amount' => ['value' => $orderamount, 'currency' => 'INR'],
+		'merchant_metadata' => ['key1' => 'DD', 'key2' => 'XOF'],
+		'refund_reason' => 'Initiated by merchant',
+	]);
+
+	$merchant_id=$this->config->get('payment_pinepg_merchantid');
+
+	// Set up headers
+	$access_token = $this->getAccessToken();
+
+	$headers = [
+		'Merchant-ID: ' . $merchant_id,
+		'Authorization: Bearer ' . $access_token,
+		'Content-Type: application/json',
+	];
+
+	// Make the API call
+	$response = $this->sendPostRequest($url, $body, $headers);
+
+$data = json_decode($response);
+$status = $data->data->status ?? null;
+$order_id = $data->data->order_id ?? null;
+$parent_order_id = $data->data->parent_order_id ?? null;
+
+	// Handle the response
+	if ($status === 'PROCESSED') {
+		// Add order history note for successful refund
+		    $this->load->model('checkout/order');
+			$Order_Status='11';
+			$comment='Refund successfull for order id : '.$order_info['order_id'].' ,Pinelabs Payment ID for this order is : '.$parent_order_id.' and Pinelabs Refund ID for this order is : '.$order_id;
+		    $this->model_checkout_order->addOrderHistory($order_info['order_id'], $Order_Status,$comment,false,false);
+			$this->logger = new Log('pinepg_'. date("Y-m-d").'.log');
+		    $this->logger->write('Refund Data Success'. serialize($response));
+
+		//return 'Refund successful';
+	} else {
+		//return 'Refund fail';
+
+		$this->logger = new Log('pinepg_'. date("Y-m-d").'.log');
+		$this->logger->write('Refund Data Fail'. serialize($response));
+		
+	}
 }
   
   public function Hex2String($hex){

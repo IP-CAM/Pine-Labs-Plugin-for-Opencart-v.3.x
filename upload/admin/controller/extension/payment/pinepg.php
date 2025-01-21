@@ -2,6 +2,67 @@
 class ControllerExtensionPaymentPinePG extends Controller {
 	private $error = array(); 
 
+
+	public function install() {
+		$this->load->model('setting/event');
+		
+
+
+		$this->log->write('Installing PinePG event...');
+	
+		// Add event to trigger on order history status change
+		$this->model_setting_event->addEvent(
+			'refund_on_status_change', // Unique event code
+			'catalog/model/checkout/order/addOrderHistory/after', // Trigger route
+			'extension/payment/pinepg/onOrderHistoryAdd' // Callback route
+		);
+
+		$this->log->write('Event refund_on_status_change registered.');
+
+		$this->load->model('extension/payment/pinepg');
+
+		$this->log->write('Add column started ');
+        
+        // Now call the install method of the model
+        $this->model_extension_payment_pinepg->install();
+
+		$this->log->write('Add column ended ');
+	}
+
+
+	public function uninstall() {
+		$this->load->model('setting/event');
+	
+		// Remove the event
+		$this->model_setting_event->deleteEventByCode('refund_on_status_change');
+	}
+
+
+	public function onOrderHistoryAdd($route, $args, $output) {
+		$order_id = $args[0]; // Order ID
+		$order_status_id = $args[1]; // New Order Status ID
+	
+		// Load required models
+		$this->load->model('localisation/order_status');
+		$this->load->model('sale/order');
+
+		$this->logger = new Log('refund_'. date("Y-m-d").'.log');
+
+		$this->logger->write('on order history is called with order id'.$order_id);
+
+	
+		// Check if the new status is "refunded"
+		$status_info = $this->model_localisation_order_status->getOrderStatus($order_status_id);
+
+		$this->logger->write('Status of order is'.$status_info);
+		if (strtolower($status_info['name']) === 'refunded') {
+			// Call your refund method
+			$this->load->model('extension/payment/pinepg');
+			$this->model_extension_payment_pinepg->process_refund($order_id);
+		}
+	}
+
+
 	public function index() {
 
 		$this->load->language('extension/payment/pinepg');
@@ -39,7 +100,6 @@ class ControllerExtensionPaymentPinePG extends Controller {
 		$data['entry_sort_order'] = $this->language->get('entry_sort_order');
 		$data['payment_entry_status'] = $this->language->get('entry_status');
 		$data['entry_order_status'] = $this->language->get('entry_order_status');
-		$data['entry_payment_mode'] = $this->language->get('entry_payment_mode');
 
 
 		$data['button_save'] = $this->language->get('button_save');
@@ -58,8 +118,7 @@ class ControllerExtensionPaymentPinePG extends Controller {
 		$data['payment_entry_status_enabled'] = $this->language->get('entry_status_enabled');
 		$data['payment_entry_status_disabled'] = $this->language->get('entry_status_disabled');
 
-		$data['entry_payment_mode_Credit_Debit'] = $this->language->get('entry_payment_mode_Credit_Debit');
-		$data['entry_payment_mode_EMI'] = $this->language->get('entry_payment_mode_EMI');
+		
 		$data['tab_general'] = $this->language->get('tab_general');
 
 		$data['CreditCard'] = $this->language->get('CreditCard');
@@ -72,7 +131,6 @@ class ControllerExtensionPaymentPinePG extends Controller {
 
 		$data['payment_pinepg_sort_order'] = '';
 		$data['payment_pinepg_secure_secret'] = '';
-		$data['payment_pinepg_payment_mode'] = '';
 
 		$data['error_access_code'] = '';
 		$data['error_secure_secret'] = '';
@@ -187,11 +245,7 @@ class ControllerExtensionPaymentPinePG extends Controller {
 			$data['payment_pinepg_sort_order'] = $this->config->get('payment_pinepg_sort_order');
 		}
 
-		if (isset($this->request->post['payment_pinepg_payment_mode'])) {
-			$data['payment_pinepg_payment_mode'] = $this->request->post['payment_pinepg_payment_mode'];
-		} else {
-			$data['payment_pinepg_payment_mode'] = $this->config->get('payment_pinepg_payment_mode');
-		}
+		
 
 
 		$this->load->model('localisation/order_status');
@@ -232,9 +286,7 @@ class ControllerExtensionPaymentPinePG extends Controller {
 		// 	$this->error['sort_order'] = $this->language->get('error_sort_order');
 		// }
 		
-		if ($this->request->post['payment_pinepg_payment_mode'] == '' || ctype_space($this->request->post['payment_pinepg_payment_mode'])) {
-			$this->error['payment_mode'] = $this->language->get('error_payment_mode');
-		}
+		
 		
 		if (!$this->error) {
 			return true;
