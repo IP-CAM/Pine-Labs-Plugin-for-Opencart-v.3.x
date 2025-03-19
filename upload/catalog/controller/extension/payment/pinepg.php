@@ -11,6 +11,45 @@ class Controllerextensionpaymentpinepg extends Controller {
 	$Order_Id=$this->session->data['order_id'];
     $order_info = $this->model_checkout_order->getOrder($this->session->data['order_id']);
 
+
+	// Fetch product details
+    $products = $this->cart->getProducts();
+    $product_details = [];
+
+    foreach ($products as $product) {
+        $product_info = $this->model_catalog_product->getProduct($product['product_id']);
+        $product_details[] = [
+            'product_id'    => $product['product_id'],
+            'name'          => $product['name'],
+            'quantity'      => $product['quantity'],
+            'price'         => $this->currency->format($product['price'], $order_info['currency_code'], $order_info['currency_value'], false),
+            'total'         => $this->currency->format($product['total'], $order_info['currency_code'], $order_info['currency_value'], false),
+            'model'         => $product_info['model'] ?? '',
+            'sku'           => $product_info['sku'] ?? '',
+        ];
+    }
+
+    $order_info['products'] = $product_details;
+	// Fetch product details
+
+// Only add coupon discount if it exists	
+$coupon_discount = 0;
+if (isset($this->session->data['coupon'])) {
+    $this->load->model('extension/total/coupon');
+    $coupon_info = $this->model_extension_total_coupon->getCoupon($this->session->data['coupon']);
+    
+    if ($coupon_info && !empty($coupon_info['discount'])) {
+        $coupon_discount = abs($coupon_info['discount']); // Ensure it's positive
+    }
+}
+
+
+if ($coupon_discount > 0) {
+    $order_info['cart_coupon_discount_amount'] = $coupon_discount;
+}
+
+// Only add coupon discount if it exists
+
     
     $this->logger->write('[Order ID]:' . $Order_Id.'  Order Info: ' . serialize($order_info));
     
@@ -62,56 +101,142 @@ class Controllerextensionpaymentpinepg extends Controller {
   private function initiatePayment($order_info) {
 
 	$this->logger->write('Inside Initiate Payment method');
-
-	$callback_url = $this->getCallbackUrl();
-
-        $PinePgMode=$this->config->get('payment_pinepg_mode');
-		if($PinePgMode == "live")
-		{
-			$url ='https://api.pluralpay.in/api/checkout/v1/orders';
-		}else{
-		    $url ='https://pluraluat.v2.pinepg.in/api/checkout/v1/orders';
+	
+		$callback_url = $this->getCallbackUrl();
+	
+			$PinePgMode=$this->config->get('payment_pinepg_mode');
+			if($PinePgMode == "live")
+			{
+				$url ='https://api.pluralpay.in/api/checkout/v1/orders';
+			}else{
+				$url ='https://pluraluat.v2.pinepg.in/api/checkout/v1/orders';
+			}
+	
+		$access_token = $this->getAccessToken();
+		if (!$access_token) {
+			return ['response_code' => 500, 'message' => 'Access token retrieval failed'];
 		}
-
-	$access_token = $this->getAccessToken();
-	if (!$access_token) {
-		return ['response_code' => 500, 'message' => 'Access token retrieval failed'];
-	}
-
-	$orderamount= $order_info['total'] * 100;
-
-	if (is_numeric($orderamount) && floor($orderamount) != $orderamount) {
-		$orderamount = ceil($orderamount);
-	}
-
-	$body = json_encode([
-		'merchant_order_reference' => $order_info['order_id'] . '_' . date('ymdHis'),
-		'order_amount' => [
-			'value' => $orderamount,
-			'currency' => 'INR',
-		],
-		'callback_url' => $callback_url,
-		'purchase_details' => [
-			'customer' => [
-				'email_id' => $order_info['email'],
-				'first_name' => $order_info['firstname'],
-				'last_name' => $order_info['lastname'],
-				//'customer_id' => $order_info['customer_id'],
-				'mobile_number' => $order_info['telephone'],
+	
+		$orderamount= $order_info['total'] * 100;
+	
+		if (is_numeric($orderamount) && floor($orderamount) != $orderamount) {
+			$orderamount = ceil($orderamount);
+		}
+	
+	
+		
+	
+		// Get ordered products and replicate as per quantity
+		$products = [];
+		$productPriceTotal=0;
+		foreach ($order_info['products'] as $product) {
+			
+			$productPrice=intval($product['price'] * 100);
+			$quantity=$product['quantity'];
+			
+	
+			for ($j = 0; $j < $quantity; $j++) {
+				if(!empty($product['sku'])){
+				$productData = [
+					'product_code' => $product['sku'],
+					'product_amount' => [
+						'value' => $productPrice,
+						'currency' => 'INR',
+					],
+				];
+			
+				$productPriceTotal=$productPriceTotal+$productPrice;
+				$products[] = $productData;
+			}
+			
+			}
+		}
+	
+		if($orderamount>$productPriceTotal){
+	
+			$additional_charge=$orderamount-$productPriceTotal;
+	
+			$productData = [
+				'product_code' => 'additional_charge',
+				'product_amount' => [
+					'value' => $additional_charge,
+					'currency' => 'INR',
+				],
+			];
+			$products[] = $productData;
+		}
+	
+		if($productPriceTotal>$orderamount){
+	
+			$orderamount=$productPriceTotal;
+		}
+	
+		$billing_address=$this->truncateAddress($order_info['payment_address_1']);
+		$shipping_address=$this->truncateAddress($order_info['shipping_address_1']);
+	
+		$body = [
+			'merchant_order_reference' => $order_info['order_id'] . '_' . date('ymdHis'),
+			'order_amount' => [
+				'value' => $orderamount,
+				'currency' => 'INR',
 			],
-		],
-	]);
+			'callback_url' => $callback_url,
+			'purchase_details' => [
+				'customer' => [
+					'email_id' => $order_info['email'],
+					'first_name' => $order_info['firstname'],
+					'last_name' => $order_info['lastname'],
+					//'customer_id' => $order_info['customer_id'],
+					'mobile_number' => $order_info['telephone'],
+				],
+				'billing_address' => [
+					'address1' => $billing_address,
+					'pincode' => $order_info['payment_postcode'],
+					'city' => $order_info['payment_city'],
+					'state' => $order_info['payment_zone'],
+					'country' => $order_info['payment_iso_code_2'],
+				],
+				'shipping_address' => [
+					'address1' => $shipping_address,
+					'pincode' => $order_info['shipping_postcode'],
+					'city' => $order_info['shipping_city'],
+					'state' => $order_info['shipping_zone'],
+					'country' => $order_info['shipping_iso_code_2'],
+				],
+				'products' => $products
+			],
+		];
+	
+	
+		// Add coupon discount only if it exists and is greater than zero
+	if (!empty($order_info['cart_coupon_discount_amount']) && $order_info['cart_coupon_discount_amount'] > 0) {
+		$body['cart_coupon_discount_amount'] = [
+			'value' => $order_info['cart_coupon_discount_amount']*100,
+			'currency' => 'INR',
+		];
+	}
+	
+	$body=json_encode($body);
+	
+		$merchant_id=$this->config->get('payment_pinepg_merchantid');
+	
+	
+		$this->logger->write('V3 request log'.$body);
+	
+		$headers = [
+			'Merchant-ID: ' . $merchant_id,
+			'Authorization: Bearer ' . $access_token,
+			'Content-Type: application/json',
+		];
+	
+		$response = $this->sendPostRequest($url, $body, $headers);
+		return json_decode($response, true);
+	}
 
-	$merchant_id=$this->config->get('payment_pinepg_merchantid');
 
-	$headers = [
-		'Merchant-ID: ' . $merchant_id,
-		'Authorization: Bearer ' . $access_token,
-		'Content-Type: application/json',
-	];
-
-	$response = $this->sendPostRequest($url, $body, $headers);
-	return json_decode($response, true);
+	
+public function truncateAddress($address) {
+    return (strlen($address) > 100) ? substr($address, 0, 100) : $address;
 }
 
 
