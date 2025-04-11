@@ -181,6 +181,12 @@ if ($coupon_discount > 0) {
 				'currency' => 'INR',
 			],
 			'callback_url' => $callback_url,
+			'pre_auth' => false,
+			  'integration_mode'=> "REDIRECT",
+			  "plugin_data"=> [
+					"plugin_type" => "Opencart",
+					"plugin_version" => "V3"
+			  ],
 			'purchase_details' => [
 				'customer' => [
 					'email_id' => $order_info['email'],
