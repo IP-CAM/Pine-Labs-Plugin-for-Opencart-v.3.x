@@ -49,5 +49,15 @@ public function getOpenCartAmount($order_id_from_api) {
   return null; // Return null if no matching record is found
 }
 
+public function getPendingOrdersToday() {
+  $query = $this->db->query("SELECT o.order_id, o.order_id_from_order_api 
+                            FROM `" . DB_PREFIX . "order` o
+                            WHERE o.order_status_id = 0 /* Pending */
+                            AND o.payment_code = 'pinepg'
+                            AND DATE(o.date_added) = CURDATE()");
+  
+  return $query->rows;
+}
+
 
 }

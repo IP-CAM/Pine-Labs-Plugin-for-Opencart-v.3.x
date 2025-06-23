@@ -432,74 +432,157 @@ $parent_order_id = $data->data->parent_order_id ?? null;
         }
 		
 
-    public function callback() 
-	{
+		public function callback() 
+{
+    $this->load->model('extension/payment/pinepg');
+    $this->logger = new Log('pinepg_'. date("Y-m-d").'.log');
+    $this->logger->write('Callback() called with POST data: ' . print_r($_POST, true));
 
-		$this->load->model('extension/payment/pinepg');
+    $signature = $_POST['signature'];
+    $order_id_from_api = $_POST['order_id'];
+    $status = $_POST['status'];
 
-		$this->logger = new Log('pinepg_'. date("Y-m-d").'.log');
-		$this->logger->write('Callback() called');
+    // Get OpenCart order ID from our metadata table
+    $opencart_order_id = $this->model_extension_payment_pinepg->getOpenCartOrderId($order_id_from_api);
+    
+    if (!$opencart_order_id) {
+        $this->logger->write("Error: No OpenCart order found for PinePG order: $order_id_from_api");
+        $this->response->redirect($this->url->link('checkout/failure'));
+        return;
+    }
 
-		$signature=$_POST['signature'];
-		$order_id_from_api=$_POST['order_id'];
-		$status=$_POST['status'];
+    // Verify payment status with retries (3 attempts, 20 seconds apart)
+    $verified_status = $this->verifyPaymentStatusWithRetry($order_id_from_api);
+    
+    if ($verified_status === 'PROCESSED') {
+        $this->handleSuccessfulPayment($opencart_order_id, $order_id_from_api);
+    } else {
+        $this->handleFailedPayment($opencart_order_id, $order_id_from_api, $verified_status);
+    }
+}
 
-		if($status=='PROCESSED' && !empty($order_id_from_api)){
+private function verifyPaymentStatusWithRetry($pinepg_order_id)
+{
+    $max_retries = 3;
+    $retry_delay = 20; // seconds
+    
+    for ($attempt = 1; $attempt <= $max_retries; $attempt++) {
+        $this->logger->write("Enquiry API attempt $attempt for order: $pinepg_order_id");
+        
+        $response = $this->callEnquiryApi($pinepg_order_id);
+        
+        if ($response && isset($response['data']['status'])) {
+            $status = $response['data']['status'];
+            $this->logger->write("Enquiry API response status: $status");
+            
+            if ($status === 'PROCESSED') {
+                return $status;
+            }
+        }
+        
+        // If not final attempt, wait before retrying
+        if ($attempt < $max_retries) {
+            sleep($retry_delay);
+        }
+    }
+    
+    return $status ?? 'UNKNOWN';
+}
 
-			$this->logger->write("Received callback with order_id_from_api: $order_id_from_api, status: $status");
+private function callEnquiryApi($pinepg_order_id)
+{
+    $PinePgMode = $this->config->get('payment_pinepg_mode');
+    $url = ($PinePgMode == "live") 
+        ? 'https://api.pluralpay.in/api/pay/v1/orders/' . $pinepg_order_id
+        : 'https://pluraluat.v2.pinepg.in/api/pay/v1/orders/' . $pinepg_order_id;
 
-			 // Query for the OpenCart order ID using order_id_from_order_api
-			 $opencart_order_id = $this->model_extension_payment_pinepg->getOpenCartOrderId($order_id_from_api);
+    $access_token = $this->getAccessToken();
+    if (!$access_token) {
+        $this->logger->write("Error: Failed to get access token");
+        return false;
+    }
 
-			 $this->load->model('checkout/order');
-			 $Order_Status='2';
-			 $comment='Payment Transation is successful. Pinelabs Payment ID: '.$order_id_from_api;
-			 $this->model_checkout_order->addOrderHistory($opencart_order_id, $Order_Status,$comment,true,false);
+    $headers = [
+        'Authorization: Bearer ' . $access_token,
+        'Accept: application/json',
+    ];
 
-			 $amount = $this->model_extension_payment_pinepg->getOpenCartAmount($opencart_order_id);
+    $ch = curl_init();
+    curl_setopt_array($ch, [
+        CURLOPT_URL => $url,
+        CURLOPT_HTTPHEADER => $headers,
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_SSL_VERIFYPEER => false,
+        CURLOPT_SSL_VERIFYHOST => false,
+        CURLOPT_TIMEOUT => 30,
+    ]);
 
+    $response = curl_exec($ch);
+    $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    
+    if (curl_errno($ch)) {
+        $this->logger->write("CURL Error: " . curl_error($ch));
+        curl_close($ch);
+        return false;
+    }
+    
+    curl_close($ch);
+    
+    if ($http_code == 200) {
+        return json_decode($response, true);
+    }
+    
+    $this->logger->write("Enquiry API failed. HTTP Code: $http_code, Response: $response");
+    return false;
+}
 
-			            $this->session->data['ppc_Amount']=$amount*100;
-						$this->session->data['Order_No']= $opencart_order_id;
-						$this->session->data['ppc_PinePGTransactionID']=$order_id_from_api;
-						$this->session->data['ppc_Is_BrandEMITransaction']=null;
-						$this->session->data['ppc_IssuerName']=null;
-						$this->session->data['ppc_EMIInterestRatePercent']=null;
-						$this->session->data['ppc_EMIAmountPayableEachMonth']=null; 
-						$this->session->data['ppc_EMITotalDiscCashBackPercent']=null;
-						$this->session->data['ppc_EMITotalDiscCashBackAmt']=null;
-						$this->session->data['ppc_EMITenureMonth']=null;
-					    $this->session->data['ppc_EMICashBackType']=null;
-						$this->session->data['ppc_EMIAdditionalCashBack']=null;
-						$this->session->data['ppc_UniqueMerchantTxnID']=$order_id_from_api;
+private function handleSuccessfulPayment($opencart_order_id, $pinepg_order_id)
+{
+    $this->load->model('checkout/order');
+    
+    // Update order status
+    $Order_Status = '2'; // Processing
+    $comment = 'Payment verified and successful. PinePG ID: ' . $pinepg_order_id;
+    $this->model_checkout_order->addOrderHistory($opencart_order_id, $Order_Status, $comment, true, false);
 
-						
+    // Set only the essential session data for success page
+    $amount = $this->model_extension_payment_pinepg->getOpenCartAmount($opencart_order_id);
+    
+    
 
-			 $this->response->redirect($this->url->link('extension/payment/pinepgsuccess', 'path=59'));
+	$this->session->data = array_merge($this->session->data, [
+        'ppc_Amount' => $amount * 100,
+        'Order_No' => $opencart_order_id,
+        'ppc_PinePGTransactionID' => $pinepg_order_id,
+        'ppc_UniqueMerchantTxnID' => $pinepg_order_id,
+        
+        // Initialize all EMI-related variables with empty values
+        'ppc_Is_BrandEMITransaction' => '',
+        'ppc_IssuerName' => '',
+        'ppc_EMIInterestRatePercent' => '',
+        'ppc_EMIAmountPayableEachMonth' => '',
+        'ppc_EMITotalDiscCashBackPercent' => '',
+        'ppc_EMITotalDiscCashBackAmt' => '',
+        'ppc_EMITenureMonth' => '',
+        'ppc_EMICashBackType' => '',
+        'ppc_EMIAdditionalCashBack' => ''
+    ]);
 
-		}else{
+    $this->logger->write("Successfully processed order $opencart_order_id with PinePG ID $pinepg_order_id");
+    $this->response->redirect($this->url->link('extension/payment/pinepgsuccess'));
+}
 
+private function handleFailedPayment($opencart_order_id, $pinepg_order_id, $status)
+{
+    $this->load->model('checkout/order');
+    
+    $Order_Status = '10'; // Failed
+    $comment = "Payment failed. Status: $status. PinePG ID: $pinepg_order_id";
+    $this->model_checkout_order->addOrderHistory($opencart_order_id, $Order_Status, $comment, true, false);
 
-			if(!empty($opencart_order_id)){
-			$opencart_order_id = $this->model_extension_payment_pinepg->getOpenCartOrderId($order_id_from_api);
-			$this->load->model('checkout/order');
-			$Order_Status='10';
-			$comment='Payment Failed. Pinelabs Payment ID: '.$order_id_from_api;
-			$this->model_checkout_order->addOrderHistory($opencart_order_id, $Order_Status,$comment,true,false);
-
-			}
-			
-
-			$this->response->redirect($this->url->link('checkout/failure', 'path=59'));
-
-			
-		}
-
-
-
-
-  }
-   
-  
+    $this->logger->write("Payment failed for order $opencart_order_id. Status: $status");
+    $this->response->redirect($this->url->link('checkout/failure'));
+}
+		
 }
 ?>
