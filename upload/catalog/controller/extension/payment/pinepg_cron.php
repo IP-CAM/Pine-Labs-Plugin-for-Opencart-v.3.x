@@ -64,6 +64,14 @@ class ControllerExtensionPaymentPinepgCron extends Controller {
             );
             
             $this->logger->write('Successfully updated order ' . $order['order_id'] . ' to PROCESSED');
+        }elseif ($status === 'CANCELLED') {
+            // Update order status to failed/cancelled
+            $this->model_checkout_order->addOrderHistory(
+                $order['order_id'],
+                10, // Failed status (or whatever your cancelled status ID is)
+                'Payment was CANCELLED in PinePG. Order marked as failed. PinePG ID: ' . $order['order_id_from_order_api'],
+                true
+            );
         }
     }
     
